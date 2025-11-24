@@ -1,1 +1,7 @@
 datasets/*
+data/*
+.ipynb_checkpoints/
+*.npy
+*.png
+*.pt
+testing_scripts/training_output_CNN/checkpoints
