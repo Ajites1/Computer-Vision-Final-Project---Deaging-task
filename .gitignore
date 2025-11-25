@@ -5,3 +5,4 @@ data/*
 *.png
 *.pt
 testing_scripts/training_output_CNN/checkpoints
+*.nfsc9a9281bcfa071e00000ebb2
