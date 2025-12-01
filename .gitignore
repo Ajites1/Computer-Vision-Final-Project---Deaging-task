@@ -6,4 +6,4 @@ data/*
 *.pt
 testing_scripts/training_output_CNN/checkpoints
 *.nfsc9a9281bcfa071e00000ebb2
-testing_scripts/__pycache__/
+testing_scripts/__pycache__
