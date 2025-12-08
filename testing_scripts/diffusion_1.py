@@ -1,0 +1,578 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+import json
+
+# =======================
+# 1. AGE & IDENTITY ENCODERS
+# =======================
+
+class AgeEncoder(nn.Module):
+    """Encodes age into an embedding vector"""
+    def __init__(self, max_age=100, embed_dim=128):
+        super().__init__()
+        self.age_embedding = nn.Embedding(max_age + 1, embed_dim)
+
+    def forward(self, age):
+        """
+        Args:
+            age: tensor of shape (batch,) with integer ages
+        Returns:
+            age_embed: (batch, embed_dim)
+        """
+        return self.age_embedding(age)
+
+
+class IdentityEncoder(nn.Module):
+    """Extracts identity features from input image"""
+    def __init__(self, output_dim=256):
+        super().__init__()
+        # Simple CNN for identity extraction
+        # In practice, you might use a pretrained face recognition model
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, 3, stride=2, padding=1),  # 128x128 -> 64x64
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # 64x64 -> 32x32
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),  # 32x32 -> 16x16
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(256, output_dim)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: input image (batch, 3, H, W)
+        Returns:
+            identity_embed: (batch, output_dim)
+        """
+        return self.encoder(x)
+
+# =======================
+# 2. U-NET WITH CONDITIONING
+# =======================
+
+class ResidualBlock(nn.Module):
+    """Residual block with time, age, and identity conditioning"""
+    def __init__(self, in_ch, out_ch, time_dim=256, cond_dim=512):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        self.norm1 = nn.GroupNorm(8, out_ch)
+        self.norm2 = nn.GroupNorm(8, out_ch)
+
+        # Conditioning projections
+        self.time_mlp = nn.Linear(time_dim, out_ch)
+        self.cond_mlp = nn.Linear(cond_dim, out_ch)
+
+        self.shortcut = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, t_embed, cond_embed):
+        """
+        Args:
+            x: (batch, in_ch, H, W)
+            t_embed: time embedding (batch, time_dim)
+            cond_embed: concatenated age+identity embedding (batch, cond_dim)
+        """
+        h = self.conv1(x)
+        h = self.norm1(h)
+
+        # Add conditioning
+        h = h + self.time_mlp(t_embed)[:, :, None, None]
+        h = h + self.cond_mlp(cond_embed)[:, :, None, None]
+
+        h = F.silu(h)
+        h = self.conv2(h)
+        h = self.norm2(h)
+        h = F.silu(h)
+
+        return h + self.shortcut(x)
+
+
+class SinusoidalPosEmb(nn.Module):
+    """Sinusoidal time embedding"""
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        device = t.device
+        half_dim = self.dim // 2
+        emb = np.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+        return emb
+
+
+class ConditionalUNet(nn.Module):
+    """U-Net conditioned on time, age, and identity"""
+    def __init__(self, img_channels=3, base_ch=64, time_dim=256, age_dim=128, identity_dim=256):
+        super().__init__()
+
+        cond_dim = age_dim + identity_dim  # Combined conditioning
+
+        # Time embedding
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(time_dim),
+            nn.Linear(time_dim, time_dim * 4),
+            nn.GELU(),
+            nn.Linear(time_dim * 4, time_dim)
+        )
+
+        # Conditioning projection
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim, cond_dim * 2),
+            nn.GELU(),
+            nn.Linear(cond_dim * 2, cond_dim)
+        )
+
+        # Encoder
+        self.enc1 = ResidualBlock(img_channels, base_ch, time_dim, cond_dim)
+        self.enc2 = ResidualBlock(base_ch, base_ch * 2, time_dim, cond_dim)
+        self.enc3 = ResidualBlock(base_ch * 2, base_ch * 4, time_dim, cond_dim)
+
+        self.pool = nn.MaxPool2d(2)
+
+        # Bottleneck
+        self.bottleneck = ResidualBlock(base_ch * 4, base_ch * 4, time_dim, cond_dim)
+
+        # Decoder
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dec3 = ResidualBlock(base_ch * 8, base_ch * 2, time_dim, cond_dim)
+        self.dec2 = ResidualBlock(base_ch * 4, base_ch, time_dim, cond_dim)
+        self.dec1 = ResidualBlock(base_ch * 2, base_ch, time_dim, cond_dim)
+
+        # Output
+        self.out = nn.Conv2d(base_ch, img_channels, 1)
+
+    def forward(self, x, t, age_embed, identity_embed):
+        """
+        Args:
+            x: noisy image (batch, 3, H, W)
+            t: timestep (batch,)
+            age_embed: (batch, age_dim)
+            identity_embed: (batch, identity_dim)
+        Returns:
+            predicted noise (batch, 3, H, W)
+        """
+        # Prepare conditioning
+        t_embed = self.time_mlp(t)
+        cond_embed = torch.cat([age_embed, identity_embed], dim=1)
+        cond_embed = self.cond_proj(cond_embed)
+
+        # Encoder
+        e1 = self.enc1(x, t_embed, cond_embed)
+        e2 = self.enc2(self.pool(e1), t_embed, cond_embed)
+        e3 = self.enc3(self.pool(e2), t_embed, cond_embed)
+
+        # Bottleneck
+        b = self.bottleneck(self.pool(e3), t_embed, cond_embed)
+
+        # Decoder with skip connections
+        d3 = self.dec3(torch.cat([self.up(b), e3], dim=1), t_embed, cond_embed)
+        d2 = self.dec2(torch.cat([self.up(d3), e2], dim=1), t_embed, cond_embed)
+        d1 = self.dec1(torch.cat([self.up(d2), e1], dim=1), t_embed, cond_embed)
+
+        return self.out(d1)
+
+# =======================
+# 3. COMPLETE MODEL
+# =======================
+
+class AgeTransformationDiffusion(nn.Module):
+    """Complete age transformation diffusion model"""
+    def __init__(self, max_age=100, img_size=256):
+        super().__init__()
+        self.age_encoder = AgeEncoder(max_age=max_age, embed_dim=128)
+        self.identity_encoder = IdentityEncoder(output_dim=256)
+        self.unet = ConditionalUNet(
+            img_channels=3,
+            base_ch=64,
+            time_dim=256,
+            age_dim=128,
+            identity_dim=256
+        )
+
+    def forward(self, x_noisy, t, current_age, target_age, x_clean):
+        """
+        Args:
+            x_noisy: noisy image at timestep t (batch, 3, H, W)
+            t: diffusion timestep (batch,)
+            current_age: current age of person (batch,)
+            target_age: target age for transformation (batch,)
+            x_clean: clean reference image for identity (batch, 3, H, W)
+        Returns:
+            predicted_noise: (batch, 3, H, W)
+        """
+        # Extract embeddings
+        identity_embed = self.identity_encoder(x_clean)
+        target_age_embed = self.age_encoder(target_age)
+
+        # Predict noise
+        noise_pred = self.unet(x_noisy, t, target_age_embed, identity_embed)
+        return noise_pred
+
+# =======================
+# 4. DATASET
+# =======================
+
+class AgeTransformationDataset(Dataset):
+    """Dataset for age transformation training"""
+    def __init__(self, image_paths, ages, identities=None, transform=None):
+        """
+        Args:
+            image_paths: list of image file paths
+            ages: list of ages corresponding to each image
+            identities: optional list of identity IDs (for longitudinal data)
+            transform: torchvision transforms
+        """
+        self.image_paths = image_paths
+        self.ages = ages
+        self.identities = identities
+        self.transform = transform or transforms.Compose([
+            transforms.Resize((256, 256), Image.LANCZOS),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image = np.load(self.image_paths[idx])
+
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            # If normalized to [0, 1], scale to [0, 255]
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
+        elif image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+
+        # Handle channel order: (H, W, C) or (C, H, W)
+        if image.ndim == 3:
+            if image.shape[0] == 3 or image.shape[0] == 1:
+                # (C, H, W) -> (H, W, C)
+                image = np.transpose(image, (1, 2, 0))
+        # Convert to PIL Image
+        if image.shape[-1] == 1:
+            image = Image.fromarray(image.squeeze(), mode='L').convert('RGB')
+        else:
+            image = Image.fromarray(image, mode='RGB')
+
+        image = self.transform(image)
+        age = torch.tensor(self.ages[idx], dtype=torch.long)
+
+        item = {'image': image, 'age': age}
+        if self.identities is not None:
+            item['identity'] = self.identities[idx]
+        return item
+
+
+
+
+class LongitudinalPairDataset(Dataset):
+    """
+    Dataset for longitudinal pairs (same person at different ages).
+    Each item returns two images of the same person.
+    """
+    def __init__(self, pairs_data, transform=None):
+        """
+        Args:
+            pairs_data: List of dicts with format:
+                [
+                    {
+                        'img1_path': 'person1_age20.jpg',
+                        'age1': 20,
+                        'img2_path': 'person1_age50.jpg',
+                        'age2': 50,
+                        'identity': 'person1'
+                    },
+                    ...
+                ]
+            transform: torchvision transforms
+        """
+        self.pairs_data = pairs_data
+        self.transform = transform or transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ])
+
+    def __len__(self):
+        return len(self.pairs_data)
+
+    def __getitem__(self, idx):
+        pair = self.pairs_data[idx]
+
+        try:
+            image = np.load(pair['img1_path'])
+        except Exception as e:
+            raise RuntimeError(f"np.load failed for {pair['img1_path']}: {e}")
+
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            # If normalized to [0, 1], scale to [0, 255]
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
+        elif image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+
+        # Handle channel order and shape
+        if image.ndim == 3:
+            if image.shape[0] in [1, 3]:  # (C, H, W) format
+                image = np.transpose(image, (1, 2, 0))
+        elif image.ndim == 2:  # Grayscale (H, W)
+            image = np.expand_dims(image, axis=-1)
+
+        # Ensure contiguous array - CRITICAL for PIL
+        image = np.ascontiguousarray(image)
+        # Convert to PIL Image
+        if image.shape[-1] == 1:
+            image = Image.fromarray(image.squeeze(), mode='L').convert('RGB')
+        else:
+            image = Image.fromarray(image, mode='RGB')
+        img1 = self.transform(image)
+
+        try:
+            image = np.load(pair['img2_path'])
+        except Exception as e:
+            raise RuntimeError(f"np.load failed for {pair['img1_path']}: {e}")
+
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            # If normalized to [0, 1], scale to [0, 255]
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
+        elif image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+
+        # Handle channel order: (H, W, C) or (C, H, W)
+        if image.ndim == 3:
+            if image.shape[0] == 3 or image.shape[0] == 1:
+                # (C, H, W) -> (H, W, C)
+                image = np.transpose(image, (1, 2, 0))
+        elif image.ndim == 2:  # Grayscale (H, W)
+            image = np.expand_dims(image, axis=-1)
+
+        # Ensure contiguous array - CRITICAL for PIL
+        image = np.ascontiguousarray(image)
+        # Convert to PIL Image
+        if image.shape[-1] == 1:
+            image = Image.fromarray(image.squeeze(), mode='L').convert('RGB')
+        else:
+            image = Image.fromarray(image, mode='RGB')
+        img2 = self.transform(image)
+        return {
+            'img1': img1,
+            'age1': torch.tensor(pair['age1'], dtype=torch.long),
+            'img2': img2,
+            'age2': torch.tensor(pair['age2'], dtype=torch.long),
+            'identity': torch.tensor(pair['identity'], dtype=torch.long)
+        }
+
+# # =======================
+# # 5. TRAINING UTILITIES
+# # =======================
+
+# class DiffusionTrainer:
+#     """Handles diffusion training with both datasets"""
+#     def __init__(self, model, num_timesteps=1000, beta_start=1e-4, beta_end=0.02):
+#         self.model = model
+#         self.num_timesteps = num_timesteps
+
+#         # Linear beta schedule
+#         self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
+#         self.alphas = 1 - self.betas
+#         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+
+#         self.betas = self.betas.to(device)
+#         self.alphas = self.alphas.to(device)
+#         self.alphas_cumprod = self.alphas_cumprod.to(device)
+#     def add_noise(self, x0, t):
+#         """Add noise to clean images according to timestep t"""
+#         sqrt_alpha_cumprod = torch.sqrt(self.alphas_cumprod[t])
+#         sqrt_one_minus_alpha_cumprod = torch.sqrt(1 - self.alphas_cumprod[t])
+
+#         noise = torch.randn_like(x0)
+#         x_t = sqrt_alpha_cumprod[:, None, None, None] * x0 + \
+#               sqrt_one_minus_alpha_cumprod[:, None, None, None] * noise
+#         return x_t, noise
+
+#     def training_step_cross_sectional(self, batch, device):
+#         """Training step for cross-sectional dataset"""
+#         images = batch['image'].to(device)
+#         ages = batch['age'].to(device)
+#         batch_size = images.shape[0]
+
+#         # Sample random timesteps
+#         t = torch.randint(0, self.num_timesteps, (batch_size,), device=device)
+
+#         # Add noise
+#         x_noisy, noise_true = self.add_noise(images, t)
+
+#         # For cross-sectional: use same image for identity and target
+#         noise_pred = self.model(x_noisy, t, ages, ages, images)
+
+#         # MSE loss
+#         loss = F.mse_loss(noise_pred, noise_true)
+#         return loss
+
+#     def training_step_longitudinal(self, img1, age1, img2, age2, device):
+#         """
+#         Training step for longitudinal dataset (same person, different ages)
+#         This helps learn identity preservation
+#         """
+
+#         batch_size = img1.shape[0]
+#         t = torch.randint(0, self.num_timesteps, (batch_size,), device=device)
+
+#         # Add noise to target age image
+#         x_noisy, noise_true = self.add_noise(img2, t)
+
+#         # Use img1 for identity, age2 for target age
+#         noise_pred = self.model(x_noisy, t, age1, age2, img1)
+
+#         loss = F.mse_loss(noise_pred, noise_true)
+#         return loss
+
+# def get_cross_sectional(path):
+#     with open(path, 'r') as f:
+#         loaded_dict = json.load(f)
+#     imgs,ages = [],[]
+#     for i in loaded_dict:
+#         for j in loaded_dict[i]:
+#             ages.append(int(i))
+#             imgs.append(loaded_dict[i][j])
+#     return imgs,ages
+
+
+# def get_longitudinal_sectional(path):
+#     with open(path, 'r') as f:
+#         loaded_dict = json.load(f)
+#     all_pairs = []
+#     person = 0
+#     for i in loaded_dict:
+#         temp_ages = []
+#         temp_imgs = []
+#         for j in loaded_dict[i]:
+#             temp_ages.append(int(j.split("_")[0]))
+#             temp_imgs.append(loaded_dict[i][j])
+#         x = 0
+#         n = len(temp_ages)
+#         while(x<n-1):
+#             d = {}
+#             d['img1_path'] = temp_imgs[x]
+#             d['age1'] = temp_ages[x]
+#             d['img2_path'] = temp_imgs[x+1]
+#             d['age2'] = temp_ages[x+1]
+#             d['identity'] = person
+#             x+=1
+#             all_pairs.append(d)
+#         person+=1
+#     return all_pairs
+
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# # device = 'cpu'
+# model = AgeTransformationDiffusion(max_age=120).to(device)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+# trainer = DiffusionTrainer(model)
+
+# # Example: Create datasets
+# # Cross-sectional dataset
+# cross_sectional_paths, cross_sectional_ages = get_cross_sectional("/projects/standard/csci5561/shared/G8/data/qtk.json")
+
+# cross_dataset = AgeTransformationDataset(cross_sectional_paths, cross_sectional_ages)
+
+# cross_dataloader = DataLoader(
+#     cross_dataset,
+#     batch_size=16,
+#     shuffle=True,
+#     num_workers=4,
+#     pin_memory=True
+# )
+
+# # Longitudinal dataset (same person at different ages)
+# # You'll need to structure this to return pairs
+
+# longitudinal_pairs = get_longitudinal_sectional("/projects/standard/csci5561/shared/G8/data/AgeDB.json")
+# longitudinal_dataset = LongitudinalPairDataset(longitudinal_pairs)
+
+# longitudinal_dataloader = DataLoader(
+#         longitudinal_dataset,
+#         batch_size=16,
+#         shuffle=True,
+#         num_workers=4,
+#         pin_memory=True
+# )
+
+# print(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
+# print(f"Device: {device}")
+# print("\nModel architecture ready for training!")
+
+# # Full training loop example
+# num_epochs = 100
+
+# for epoch in range(num_epochs):
+#     model.train()
+#     epoch_loss_cross = 0
+#     epoch_loss_long = 0
+
+#     # Train on cross-sectional data (shuffled each epoch)
+#     for batch_idx, batch in enumerate(cross_dataloader):
+#         loss = trainer.training_step_cross_sectional(batch, device)
+#         optimizer.zero_grad()
+#         loss.backward()
+#         optimizer.step()
+#         epoch_loss_cross += loss.item()
+
+#         if batch_idx % 100 == 0:
+#             print(f"Epoch {epoch}, Cross-sectional batch {batch_idx}, Loss: {loss.item():.4f}")
+
+#     # Train on longitudinal data (shuffled each epoch)
+#     for batch_idx, batch in enumerate(longitudinal_dataloader):
+#         loss = trainer.training_step_longitudinal(
+#             batch['img1'].to(device),
+#             batch['age1'].to(device),
+#             batch['img2'].to(device),
+#             batch['age2'].to(device),
+#             device
+#         )
+#         optimizer.zero_grad()
+#         loss.backward()
+#         optimizer.step()
+#         epoch_loss_long += loss.item()
+
+#         if batch_idx % 100 == 0:
+#             print(f"Epoch {epoch}, Longitudinal batch {batch_idx}, Loss: {loss.item():.4f}")
+
+#     # Print epoch summary
+#     avg_loss_cross = epoch_loss_cross / len(cross_dataloader)
+#     avg_loss_long = epoch_loss_long / len(longitudinal_dataloader)
+#     print(f"\n=== Epoch {epoch} Complete ===")
+#     print(f"Avg Cross-sectional Loss: {avg_loss_cross:.4f}")
+#     print(f"Avg Longitudinal Loss: {avg_loss_long:.4f}\n")
+
+#     # Save checkpoint every 10 epochs
+#     if (epoch + 1) % 5 == 0:
+#         torch.save({
+#             'epoch': epoch,
+#             'model_state_dict': model.state_dict(),
+#             'optimizer_state_dict': optimizer.state_dict(),
+#             'loss_cross': avg_loss_cross,
+#             'loss_long': avg_loss_long,
+#         }, f'epochs_attempt1/checkpoint_epoch_{epoch}.pt')
+

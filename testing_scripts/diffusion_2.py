@@ -1,0 +1,768 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.cuda.amp import autocast, GradScaler
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+import json
+
+# =======================
+# 1. AGE & IDENTITY ENCODERS
+# =======================
+
+class IdentityEncoder(nn.Module):
+    """
+    identity encoder 384 dimensions
+    """
+    def __init__(self, output_dim=384):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            # Block 1: 256x256 -> 128x128
+            nn.Conv2d(3, 64, 3, stride=2, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+
+            # Block 2: 128x128 -> 64x64
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+
+            # Block 3: 64x64 -> 32x32
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+
+            # Block 4: 32x32 -> 16x16
+            nn.Conv2d(256, 384, 3, stride=2, padding=1),
+            nn.GroupNorm(8, 384),
+            nn.SiLU(),
+
+            # Global pool and project
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten()
+        )
+
+        self.proj = nn.Sequential(
+            nn.Linear(384, output_dim),
+            nn.SiLU(),
+            nn.Linear(output_dim, output_dim)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: input image (batch, 3, H, W)
+        Returns:
+            identity_embed: (batch, output_dim)
+        """
+        features = self.encoder(x)
+        return self.proj(features)
+
+# =======================
+# ATTENTION BLOCK
+# =======================
+class AgeEncoder(nn.Module):
+    """Encodes age into an embedding vector"""
+    def __init__(self, max_age=100, embed_dim=128):
+        super().__init__()
+        self.age_embedding = nn.Embedding(max_age + 1, embed_dim)
+
+    def forward(self, age):
+        """
+        Args:
+            age: tensor of shape (batch,) with integer ages
+        Returns:
+            age_embed: (batch, embed_dim)
+        """
+        return self.age_embedding(age)
+
+class SpatialAttention(nn.Module):
+    """Self-attention for spatial features"""
+    def __init__(self, channels, num_heads=8):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+
+        assert channels % num_heads == 0, "channels must be divisible by num_heads"
+
+        self.norm = nn.GroupNorm(8, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, channels, H, W)
+        Returns:
+            attention output: (batch, channels, H, W)
+        """
+        B, C, H, W = x.shape
+
+        # Normalize
+        h = self.norm(x)
+
+        # Compute Q, K, V
+        qkv = self.qkv(h)
+        qkv = qkv.reshape(B, 3, self.num_heads, C // self.num_heads, H * W)
+        qkv = qkv.permute(1, 0, 2, 4, 3)  # (3, B, heads, HW, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Attention
+        scale = (C // self.num_heads) ** -0.5
+        attn = torch.softmax(q @ k.transpose(-2, -1) * scale, dim=-1)
+
+        # Apply attention
+        out = attn @ v  # (B, heads, HW, head_dim)
+        out = out.permute(0, 1, 3, 2).reshape(B, C, H, W)
+
+        # Project and residual
+        out = self.proj(out)
+        return x + out
+
+# =======================
+# 2. U-NET WITH CONDITIONING
+# =======================
+
+class ResidualBlock(nn.Module):
+    """Residual block with better conditioning"""
+    def __init__(self, in_ch, out_ch, time_dim=256, cond_dim=640, dropout=0.1):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        self.norm1 = nn.GroupNorm(8, out_ch)
+        self.norm2 = nn.GroupNorm(8, out_ch)
+        self.dropout = nn.Dropout(dropout)
+
+        # Separate projections for time and conditioning
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, out_ch * 2)  # Scale and shift
+        )
+
+        self.cond_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, out_ch * 2)  # Scale and shift
+        )
+
+        self.shortcut = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, t_embed, cond_embed):
+        """
+        Args:
+            x: (batch, in_ch, H, W)
+            t_embed: time embedding (batch, time_dim)
+            cond_embed: concatenated age+identity embedding (batch, cond_dim)
+        """
+        h = self.conv1(x)
+        h = self.norm1(h)
+
+        # Time conditioning with scale and shift
+        time_emb = self.time_mlp(t_embed)
+        time_scale, time_shift = time_emb.chunk(2, dim=1)
+        h = h * (1 + time_scale[:, :, None, None]) + time_shift[:, :, None, None]
+
+        # Conditioning with scale and shift
+        cond_emb = self.cond_mlp(cond_embed)
+        cond_scale, cond_shift = cond_emb.chunk(2, dim=1)
+        h = h * (1 + cond_scale[:, :, None, None]) + cond_shift[:, :, None, None]
+
+        h = F.silu(h)
+        h = self.dropout(h)
+        h = self.conv2(h)
+        h = self.norm2(h)
+        h = F.silu(h)
+
+        return h + self.shortcut(x)
+
+
+class SinusoidalPosEmb(nn.Module):
+    """Sinusoidal time embedding"""
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        device = t.device
+        half_dim = self.dim // 2
+        emb = np.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+        return emb
+
+class ConditionalUNet(nn.Module):
+    """
+    Memory-efficient U-Net with attention layers:
+    - 4 encoder/decoder levels
+    - Attention only at bottleneck (most important)
+    - Moderate base channels
+    - Gradient checkpointing enabled
+    """
+    def __init__(
+        self,
+        img_channels=3,
+        base_ch=96,  # Reduced from 128 for memory
+        time_dim=256,
+        age_dim=128,
+        identity_dim=384,  # Reduced from 512 for memory
+        dropout=0.1,
+        use_checkpoint=True  # Gradient checkpointing for memory
+    ):
+        super().__init__()
+
+        self.use_checkpoint = use_checkpoint
+        cond_dim = age_dim + identity_dim  # 512 total
+
+        # Time embedding
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(time_dim),
+            nn.Linear(time_dim, time_dim * 4),
+            nn.GELU(),
+            nn.Linear(time_dim * 4, time_dim)
+        )
+
+        # Conditioning projection
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim, cond_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(cond_dim * 2, cond_dim)
+        )
+
+        # ENCODER (4 levels, 1 block each for memory efficiency)
+        # Level 1: 256x256, channels=96
+        self.enc1 = ResidualBlock(img_channels, base_ch, time_dim, cond_dim, dropout)
+        self.down1 = nn.Conv2d(base_ch, base_ch, 3, stride=2, padding=1)
+
+        # Level 2: 128x128, channels=192
+        self.enc2 = ResidualBlock(base_ch, base_ch * 2, time_dim, cond_dim, dropout)
+        self.down2 = nn.Conv2d(base_ch * 2, base_ch * 2, 3, stride=2, padding=1)
+
+        # Level 3: 64x64, channels=288
+        self.enc3 = ResidualBlock(base_ch * 2, base_ch * 3, time_dim, cond_dim, dropout)
+        self.down3 = nn.Conv2d(base_ch * 3, base_ch * 3, 3, stride=2, padding=1)
+
+        # Level 4: 32x32, channels=384
+        self.enc4 = ResidualBlock(base_ch * 3, base_ch * 4, time_dim, cond_dim, dropout)
+        self.down4 = nn.Conv2d(base_ch * 4, base_ch * 4, 3, stride=2, padding=1)
+
+        # BOTTLENECK: 16x16, channels=384 (ONLY attention here to save memory)
+        self.bottleneck1 = ResidualBlock(base_ch * 4, base_ch * 4, time_dim, cond_dim, dropout)
+        self.bottleneck_attn = SpatialAttention(base_ch * 4, num_heads=8)  # Critical attention!
+        self.bottleneck2 = ResidualBlock(base_ch * 4, base_ch * 4, time_dim, cond_dim, dropout)
+
+        # DECODER (4 levels, 1 block each)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+
+        # Level 4: 32x32
+        self.dec4 = ResidualBlock(base_ch * 8, base_ch * 4, time_dim, cond_dim, dropout)
+
+        # Level 3: 64x64
+        self.dec3 = ResidualBlock(base_ch * 7, base_ch * 3, time_dim, cond_dim, dropout)
+
+        # Level 2: 128x128
+        self.dec2 = ResidualBlock(base_ch * 5, base_ch * 2, time_dim, cond_dim, dropout)
+
+        # Level 1: 256x256
+        self.dec1 = ResidualBlock(base_ch * 3, base_ch, time_dim, cond_dim, dropout)
+
+        # Output
+        self.out = nn.Sequential(
+            nn.GroupNorm(8, base_ch),
+            nn.SiLU(),
+            nn.Conv2d(base_ch, img_channels, 3, padding=1)
+        )
+
+    def forward(self, x, t, age_embed, identity_embed):
+        """
+        Args:
+            x: noisy image (batch, 3, H, W)
+            t: timestep (batch,)
+            age_embed: (batch, age_dim)
+            identity_embed: (batch, identity_dim)
+        Returns:
+            predicted noise (batch, 3, H, W)
+        """
+        # Prepare conditioning
+        t_embed = self.time_mlp(t)
+        cond_embed = torch.cat([age_embed, identity_embed], dim=1)
+        cond_embed = self.cond_proj(cond_embed)
+
+        # Helper function for gradient checkpointing
+        def create_forward_fn(module):
+            def forward_fn(*inputs):
+                return module(*inputs)
+            return forward_fn
+
+        # ENCODER
+        if self.use_checkpoint and self.training:
+            e1 = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.enc1), x, t_embed, cond_embed, use_reentrant=False
+            )
+        else:
+            e1 = self.enc1(x, t_embed, cond_embed)
+
+        if self.use_checkpoint and self.training:
+            e2 = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.enc2), self.down1(e1), t_embed, cond_embed, use_reentrant=False
+            )
+        else:
+            e2 = self.enc2(self.down1(e1), t_embed, cond_embed)
+
+        if self.use_checkpoint and self.training:
+            e3 = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.enc3), self.down2(e2), t_embed, cond_embed, use_reentrant=False
+            )
+        else:
+            e3 = self.enc3(self.down2(e2), t_embed, cond_embed)
+
+        if self.use_checkpoint and self.training:
+            e4 = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.enc4), self.down3(e3), t_embed, cond_embed, use_reentrant=False
+            )
+        else:
+            e4 = self.enc4(self.down3(e3), t_embed, cond_embed)
+
+        # BOTTLENECK (with attention)
+        if self.use_checkpoint and self.training:
+            b = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.bottleneck1), self.down4(e4), t_embed, cond_embed, use_reentrant=False
+            )
+            b = torch.utils.checkpoint.checkpoint(self.bottleneck_attn, b, use_reentrant=False)
+            b = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.bottleneck2), b, t_embed, cond_embed, use_reentrant=False
+            )
+        else:
+            b = self.bottleneck1(self.down4(e4), t_embed, cond_embed)
+            b = self.bottleneck_attn(b)
+            b = self.bottleneck2(b, t_embed, cond_embed)
+
+        # DECODER
+        d4_in = torch.cat([self.up(b), e4], dim=1)
+        if self.use_checkpoint and self.training:
+            d4 = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.dec4), d4_in, t_embed, cond_embed, use_reentrant=False
+            )
+        else:
+            d4 = self.dec4(d4_in, t_embed, cond_embed)
+
+        d3_in = torch.cat([self.up(d4), e3], dim=1)
+        if self.use_checkpoint and self.training:
+            d3 = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.dec3), d3_in, t_embed, cond_embed, use_reentrant=False
+            )
+        else:
+            d3 = self.dec3(d3_in, t_embed, cond_embed)
+
+        d2_in = torch.cat([self.up(d3), e2], dim=1)
+        if self.use_checkpoint and self.training:
+            d2 = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.dec2), d2_in, t_embed, cond_embed, use_reentrant=False
+            )
+        else:
+            d2 = self.dec2(d2_in, t_embed, cond_embed)
+
+        d1_in = torch.cat([self.up(d2), e1], dim=1)
+        if self.use_checkpoint and self.training:
+            d1 = torch.utils.checkpoint.checkpoint(
+                create_forward_fn(self.dec1), d1_in, t_embed, cond_embed, use_reentrant=False
+            )
+        else:
+            d1 = self.dec1(d1_in, t_embed, cond_embed)
+
+        return self.out(d1)
+
+# =======================
+# 3. COMPLETE MODEL
+# =======================
+
+class AgeTransformationDiffusion(nn.Module):
+    """Complete age transformation diffusion model - Memory optimized for 40GB"""
+    def __init__(self, max_age=100, img_size=256):
+        super().__init__()
+        self.age_encoder = AgeEncoder(max_age=max_age, embed_dim=128)
+        self.identity_encoder = IdentityEncoder(output_dim=384)  # Reduced
+        self.unet = ConditionalUNet(
+            img_channels=3,
+            base_ch=96,  # Reduced
+            time_dim=256,
+            age_dim=128,
+            identity_dim=384,  # Reduced
+            dropout=0.1,
+            use_checkpoint=True  # Enable gradient checkpointing
+        )
+
+    def forward(self, x_noisy, t, current_age, target_age, x_clean):
+        """
+        Args:
+            x_noisy: noisy image at timestep t (batch, 3, H, W)
+            t: diffusion timestep (batch,)
+            current_age: current age of person (batch,)
+            target_age: target age for transformation (batch,)
+            x_clean: clean reference image for identity (batch, 3, H, W)
+        Returns:
+            predicted_noise: (batch, 3, H, W)
+        """
+        # Extract embeddings
+        identity_embed = self.identity_encoder(x_clean)
+        target_age_embed = self.age_encoder(target_age)
+
+        # Predict noise
+        noise_pred = self.unet(x_noisy, t, target_age_embed, identity_embed)
+        return noise_pred
+
+# =======================
+# 4. DATASET
+# =======================
+
+class AgeTransformationDataset(Dataset):
+    """Dataset for age transformation training"""
+    def __init__(self, image_paths, ages, identities=None, transform=None):
+        """
+        Args:
+            image_paths: list of image file paths
+            ages: list of ages corresponding to each image
+            identities: optional list of identity IDs (for longitudinal data)
+            transform: torchvision transforms
+        """
+        self.image_paths = image_paths
+        self.ages = ages
+        self.identities = identities
+        self.transform = transform or transforms.Compose([
+            transforms.Resize((256, 256), Image.LANCZOS),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image = np.load(self.image_paths[idx])
+
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            # If normalized to [0, 1], scale to [0, 255]
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
+        elif image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+
+        # Handle channel order: (H, W, C) or (C, H, W)
+        if image.ndim == 3:
+            if image.shape[0] == 3 or image.shape[0] == 1:
+                # (C, H, W) -> (H, W, C)
+                image = np.transpose(image, (1, 2, 0))
+        # Convert to PIL Image
+        if image.shape[-1] == 1:
+            image = Image.fromarray(image.squeeze(), mode='L').convert('RGB')
+        else:
+            image = Image.fromarray(image, mode='RGB')
+
+        image = self.transform(image)
+        age = torch.tensor(self.ages[idx], dtype=torch.long)
+
+        item = {'image': image, 'age': age}
+        if self.identities is not None:
+            item['identity'] = self.identities[idx]
+        return item
+
+
+
+
+class LongitudinalPairDataset(Dataset):
+    """
+    Dataset for longitudinal pairs (same person at different ages).
+    Each item returns two images of the same person.
+    """
+    def __init__(self, pairs_data, transform=None):
+        """
+        Args:
+            pairs_data: List of dicts with format:
+                [
+                    {
+                        'img1_path': 'person1_age20.jpg',
+                        'age1': 20,
+                        'img2_path': 'person1_age50.jpg',
+                        'age2': 50,
+                        'identity': 'person1'
+                    },
+                    ...
+                ]
+            transform: torchvision transforms
+        """
+        self.pairs_data = pairs_data
+        self.transform = transform or transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ])
+
+    def __len__(self):
+        return len(self.pairs_data)
+
+    def __getitem__(self, idx):
+        pair = self.pairs_data[idx]
+
+        try:
+            image = np.load(pair['img1_path'])
+        except Exception as e:
+            raise RuntimeError(f"np.load failed for {pair['img1_path']}: {e}")
+
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            # If normalized to [0, 1], scale to [0, 255]
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
+        elif image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+
+        # Handle channel order and shape
+        if image.ndim == 3:
+            if image.shape[0] in [1, 3]:  # (C, H, W) format
+                image = np.transpose(image, (1, 2, 0))
+        elif image.ndim == 2:  # Grayscale (H, W)
+            image = np.expand_dims(image, axis=-1)
+
+        # Ensure contiguous array - CRITICAL for PIL
+        image = np.ascontiguousarray(image)
+        # Convert to PIL Image
+        if image.shape[-1] == 1:
+            image = Image.fromarray(image.squeeze(), mode='L').convert('RGB')
+        else:
+            image = Image.fromarray(image, mode='RGB')
+        img1 = self.transform(image)
+
+        try:
+            image = np.load(pair['img2_path'])
+        except Exception as e:
+            raise RuntimeError(f"np.load failed for {pair['img1_path']}: {e}")
+
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            # If normalized to [0, 1], scale to [0, 255]
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
+        elif image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+
+        # Handle channel order: (H, W, C) or (C, H, W)
+        if image.ndim == 3:
+            if image.shape[0] == 3 or image.shape[0] == 1:
+                # (C, H, W) -> (H, W, C)
+                image = np.transpose(image, (1, 2, 0))
+        elif image.ndim == 2:  # Grayscale (H, W)
+            image = np.expand_dims(image, axis=-1)
+
+        # Ensure contiguous array - CRITICAL for PIL
+        image = np.ascontiguousarray(image)
+        # Convert to PIL Image
+        if image.shape[-1] == 1:
+            image = Image.fromarray(image.squeeze(), mode='L').convert('RGB')
+        else:
+            image = Image.fromarray(image, mode='RGB')
+        img2 = self.transform(image)
+        return {
+            'img1': img1,
+            'age1': torch.tensor(pair['age1'], dtype=torch.long),
+            'img2': img2,
+            'age2': torch.tensor(pair['age2'], dtype=torch.long),
+            'identity': torch.tensor(pair['identity'], dtype=torch.long)
+        }
+
+# =======================
+# 5. TRAINING UTILITIES
+# =======================
+
+# class DiffusionTrainer:
+#     """Handles diffusion training with both datasets"""
+#     def __init__(self, model, num_timesteps=1000, beta_start=1e-4, beta_end=0.02):
+#         self.model = model
+#         self.num_timesteps = num_timesteps
+
+#         # Linear beta schedule
+#         self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
+#         self.alphas = 1 - self.betas
+#         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+
+#         self.betas = self.betas.to(device)
+#         self.alphas = self.alphas.to(device)
+#         self.alphas_cumprod = self.alphas_cumprod.to(device)
+#     def add_noise(self, x0, t):
+#         """Add noise to clean images according to timestep t"""
+#         sqrt_alpha_cumprod = torch.sqrt(self.alphas_cumprod[t])
+#         sqrt_one_minus_alpha_cumprod = torch.sqrt(1 - self.alphas_cumprod[t])
+
+#         noise = torch.randn_like(x0)
+#         x_t = sqrt_alpha_cumprod[:, None, None, None] * x0 + \
+#               sqrt_one_minus_alpha_cumprod[:, None, None, None] * noise
+#         return x_t, noise
+
+#     def training_step_cross_sectional(self, batch, device):
+#         """Training step for cross-sectional dataset"""
+#         images = batch['image'].to(device)
+#         ages = batch['age'].to(device)
+#         batch_size = images.shape[0]
+
+#         # Sample random timesteps
+#         t = torch.randint(0, self.num_timesteps, (batch_size,), device=device)
+
+#         # Add noise
+#         x_noisy, noise_true = self.add_noise(images, t)
+
+#         # For cross-sectional: use same image for identity and target
+#         noise_pred = self.model(x_noisy, t, ages, ages, images)
+
+#         # MSE loss
+#         loss = F.mse_loss(noise_pred, noise_true)
+#         return loss
+
+#     def training_step_longitudinal(self, img1, age1, img2, age2, device):
+#         """
+#         Training step for longitudinal dataset (same person, different ages)
+#         This helps learn identity preservation
+#         """
+
+#         batch_size = img1.shape[0]
+#         t = torch.randint(0, self.num_timesteps, (batch_size,), device=device)
+
+#         # Add noise to target age image
+#         x_noisy, noise_true = self.add_noise(img2, t)
+
+#         # Use img1 for identity, age2 for target age
+#         noise_pred = self.model(x_noisy, t, age1, age2, img1)
+
+#         loss = F.mse_loss(noise_pred, noise_true)
+#         return loss
+
+# def get_cross_sectional(path):
+#     with open(path, 'r') as f:
+#         loaded_dict = json.load(f)
+#     imgs,ages = [],[]
+#     for i in loaded_dict:
+#         for j in loaded_dict[i]:
+#             ages.append(int(i))
+#             imgs.append(loaded_dict[i][j])
+#     return imgs,ages
+
+
+# def get_longitudinal_sectional(path):
+#     with open(path, 'r') as f:
+#         loaded_dict = json.load(f)
+#     all_pairs = []
+#     person = 0
+#     for i in loaded_dict:
+#         temp_ages = []
+#         temp_imgs = []
+#         for j in loaded_dict[i]:
+#             temp_ages.append(int(j.split("_")[0]))
+#             temp_imgs.append(loaded_dict[i][j])
+#         x = 0
+#         n = len(temp_ages)
+#         while(x<n-1):
+#             d = {}
+#             d['img1_path'] = temp_imgs[x]
+#             d['age1'] = temp_ages[x]
+#             d['img2_path'] = temp_imgs[x+1]
+#             d['age2'] = temp_ages[x+1]
+#             d['identity'] = person
+#             x+=1
+#             all_pairs.append(d)
+#         person+=1
+#     return all_pairs
+
+# class EMA:
+#     def __init__(self, model, decay=0.9999):
+#         self.model = model
+#         self.decay = decay
+#         self.shadow = {}
+#         self.backup = {}
+#         self.register()
+
+#     def register(self):
+#         for name, param in self.model.named_parameters():
+#             if param.requires_grad:
+#                 self.shadow[name] = param.data.clone()
+
+#     def update(self):
+#         for name, param in self.model.named_parameters():
+#             if param.requires_grad:
+#                 self.shadow[name].data = (
+#                     self.decay * self.shadow[name].data +
+#                     (1.0 - self.decay) * param.data
+#                 )
+
+#     def apply_shadow(self):
+#         for name, param in self.model.named_parameters():
+#             if param.requires_grad:
+#                 self.backup[name] = param.data
+#                 param.data = self.shadow[name]
+
+#     def restore(self):
+#         for name, param in self.model.named_parameters():
+#             if param.requires_grad:
+#                 param.data = self.backup[name]
+#         self.backup = {}
+
+# def find_latest_checkpoint(checkpoint_dir='epochs_attempt2_large'):
+#     """
+#     Automatically find the latest checkpoint in a directory
+#     """
+#     import glob
+#     checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_epoch_*.pt'))
+#     if not checkpoints:
+#         return None
+
+#     # Extract epoch numbers and find max
+#     epochs = [int(f.split('_')[-1].split('.')[0]) for f in checkpoints]
+#     latest_idx = epochs.index(max(epochs))
+#     return checkpoints[latest_idx]
+
+# =======================
+# 9. MODEL SUMMARY
+# =======================
+
+def count_parameters(model):
+    """Count trainable parameters"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+if __name__ == "__main__":
+    # Create model and count parameters
+    model = AgeTransformationDiffusion(max_age=100, img_size=256)
+    
+    total_params = count_parameters(model)
+    identity_params = count_parameters(model.identity_encoder)
+    age_params = count_parameters(model.age_encoder)
+    unet_params = count_parameters(model.unet)
+    
+    print("=" * 60)
+    print("LARGE-SCALE AGE TRANSFORMATION DIFFUSION MODEL")
+    print("=" * 60)
+    print(f"Total Parameters: {total_params:,}")
+    print(f"  - Identity Encoder: {identity_params:,}")
+    print(f"  - Age Encoder: {age_params:,}")
+    print(f"  - U-Net: {unet_params:,}")
+    print("=" * 60)
+    print("\nKey Improvements:")
+    print("  ✓ 192 base channels (2x increase)")
+    print("  ✓ 3 residual blocks per level (3x increase)")
+    print("  ✓ Multi-resolution attention (3 levels)")
+    print("  ✓ Cross-attention conditioning")
+    print("  ✓ Deeper identity encoder (5 levels)")
+    print("  ✓ 6-block bottleneck with attention")
+    print("  ✓ Enhanced embeddings (256/768 dims)")
+    print("=" * 60)
