@@ -2,10 +2,12 @@
 Final project for Computer Vision
 
 ### Instructions to Run Code
-To train the model run the `diffusion.ipynb` notebook in the training scripts module. The trainer will save the models to a specified folder `epochs_attempt1` folder. Currently the trainer is training the first iteration of the model. The 3 model architectures that we tested are in the .py files `diffusion_1, diffusion_2, diffusion_3`
+To train the model run the `diffusion.ipynb` notebook in the training scripts module. The trainer will save the models to a specified folder. Currently, the trainer is training the first iteration of the model. The 3 model architectures that we tested are in the .py files `diffusion_1, diffusion_2, diffusion_3.`
 
+There are testing scripts named `diffusion_test_model#` where # is the model number. These take in an image, current age, and target age and output a new person's image.
 
-You can dowload the weights from the attached google drive. There are testing scripts named `diffusion_test_model#` where # is the model number. These take in a image, current age, and target age and output a new person's image.
+You can download the weights for each model from [Google Drive](https://drive.google.com/drive/folders/12Z2-qYfdntCCWAosQUfV-GFVP3bs64cz?usp=sharing)
+
 ### Members
 Ajitesh Parthasarathy (parth057@umn.edu), William Chastek (chast068@umn.edu), Viswa Nadimpalli (nadim016@umn.edu)
 
